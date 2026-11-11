@@ -2,7 +2,7 @@ import Cocoa
 import IOKit.pwr_mgt
 import ServiceManagement
 
-let appVersion = "1.0.0"
+let appVersion = "1.1.0"
 let repoURL = URL(string: "https://github.com/alexandregillan/StayAwake")!
 
 // MARK: - Shell helpers
@@ -127,6 +127,7 @@ enum SudoersRule {
     }
 }
 
+
 // MARK: - Lid (clamshell) sleep
 
 enum Lid {
@@ -140,24 +141,58 @@ enum Lid {
         return false
     }
 
-    @discardableResult
-    static func setDisabled(_ on: Bool) -> Bool {
-        let value = on ? "1" : "0"
-
-        // Fast path: the sudoers rule grants NOPASSWD for exactly this command.
-        // -n makes sudo fail immediately instead of prompting.
+    /// Uses the sudoers rule, which grants NOPASSWD for exactly this command.
+    /// Never shows UI: `sudo -n` fails immediately instead of prompting.
+    static func setSilently(_ on: Bool) -> Bool {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        p.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", value]
+        p.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"]
         p.standardOutput = Pipe()
         p.standardError = Pipe()
-        if (try? p.run()) != nil {
-            p.waitUntilExit()
-            if p.terminationStatus == 0 { return true }
-        }
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
 
-        // No rule installed, so fall back to the admin password prompt.
-        return runAsAdmin("/usr/bin/pmset -a disablesleep \(value)")
+    /// Tries the passwordless rule, then falls back to the admin password prompt.
+    @discardableResult
+    static func setDisabled(_ on: Bool) -> Bool {
+        setSilently(on) || runAsAdmin("/usr/bin/pmset -a disablesleep \(on ? "1" : "0")")
+    }
+}
+
+// MARK: - Durations
+
+enum Duration: String, CaseIterable {
+    case unlimited, oneHour, twoHours, fourHours, eightHours, until9AM
+
+    var title: String {
+        switch self {
+        case .unlimited: return "No time limit"
+        case .oneHour: return "1 hour"
+        case .twoHours: return "2 hours"
+        case .fourHours: return "4 hours"
+        case .eightHours: return "8 hours"
+        case .until9AM: return "Until 9 AM"
+        }
+    }
+
+    /// Seconds from now, or nil for no limit. Evaluated at turn-on time so
+    /// "Until 9 AM" always means the next 9 AM.
+    var seconds: TimeInterval? {
+        switch self {
+        case .unlimited: return nil
+        case .oneHour: return 3600
+        case .twoHours: return 7200
+        case .fourHours: return 14400
+        case .eightHours: return 28800
+        case .until9AM:
+            let cal = Calendar.current
+            let now = Date()
+            var next = cal.date(bySettingHour: 9, minute: 0, second: 0, of: now)!
+            if next <= now { next = cal.date(byAdding: .day, value: 1, to: next)! }
+            return next.timeIntervalSince(now)
+        }
     }
 }
 
@@ -165,6 +200,10 @@ enum Lid {
 
 enum Prefs {
     private static let d = UserDefaults.standard
+
+    static func registerDefaults() {
+        d.register(defaults: ["keepDisplayOn": true, "disableScreensaver": true])
+    }
 
     static var hasLaunchedBefore: Bool {
         get { d.bool(forKey: "hasLaunchedBefore") }
@@ -176,38 +215,241 @@ enum Prefs {
         get { d.bool(forKey: "lidAskEachTime") }
         set { d.set(newValue, forKey: "lidAskEachTime") }
     }
+
+    static var keepDisplayOn: Bool {
+        get { d.bool(forKey: "keepDisplayOn") }
+        set { d.set(newValue, forKey: "keepDisplayOn") }
+    }
+
+    static var disableScreensaver: Bool {
+        get { d.bool(forKey: "disableScreensaver") }
+        set { d.set(newValue, forKey: "disableScreensaver") }
+    }
+
+    /// How long a session lasts when switched on.
+    static var duration: Duration {
+        get { Duration(rawValue: d.string(forKey: "duration") ?? "") ?? .unlimited }
+        set { d.set(newValue.rawValue, forKey: "duration") }
+    }
+}
+
+// MARK: - Menu rows
+
+/// Round icon in the style of Control Center: accent-filled when on.
+final class BadgeView: NSView {
+    private let symbolName: String
+    var isOn = false { didSet { needsDisplay = true } }
+
+    init(symbolName: String) {
+        self.symbolName = symbolName
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let fill: NSColor = isOn ? .controlAccentColor : NSColor.labelColor.withAlphaComponent(0.1)
+        fill.setFill()
+        NSBezierPath(ovalIn: bounds).fill()
+
+        let tint: NSColor = isOn ? .white : .labelColor
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+        guard let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config) else { return }
+        let s = img.size
+        img.draw(in: NSRect(x: bounds.midX - s.width / 2, y: bounds.midY - s.height / 2,
+                            width: s.width, height: s.height))
+    }
+}
+
+/// A switch drawn by hand. NSSwitch only shows its "on" colour in an active
+/// window, and a menu bar app's menu never is one, so there it looks grey
+/// even when on. Sized to match the system switch.
+final class ToggleSwitch: NSView {
+    private(set) var isOn = false
+    /// 0 is off, 1 is on, animated in between.
+    private var progress: CGFloat = 0 { didSet { needsDisplay = true } }
+    private var animation: Timer?
+    /// Called when VoiceOver presses the switch.
+    var onPress: (() -> Void)?
+
+    func setOn(_ on: Bool, animated: Bool) {
+        guard on != isOn else { return }
+        isOn = on
+        animation?.invalidate()
+        animation = nil
+        let target: CGFloat = on ? 1 : 0
+        guard animated else { progress = target; return }
+
+        let start = progress, began = Date(), duration = 0.18
+        let t = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let f = min(1, CGFloat(Date().timeIntervalSince(began) / duration))
+            self.progress = start + (target - start) * (1 - pow(1 - f, 3))   // ease out
+            if f >= 1 { timer.invalidate(); self.animation = nil }
+        }
+        RunLoop.main.add(t, forMode: .common)   // keeps running while the menu is open
+        animation = t
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let track = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2,
+                                 yRadius: bounds.height / 2)
+        NSColor.labelColor.withAlphaComponent(0.16).setFill()
+        track.fill()
+        if progress > 0 {
+            NSColor.controlAccentColor.withAlphaComponent(progress).setFill()
+            track.fill()
+        }
+
+        let inset: CGFloat = 2.5
+        let knobWidth: CGFloat = 26
+        let travel = bounds.width - knobWidth - inset * 2
+        let knob = NSRect(x: inset + travel * progress, y: inset,
+                          width: knobWidth, height: bounds.height - inset * 2)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.25)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: -0.5)
+        shadow.set()
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: knob, xRadius: knob.height / 2, yRadius: knob.height / 2).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .checkBox }
+    override func accessibilitySubrole() -> NSAccessibility.Subrole? { .switch }
+    override func accessibilityValue() -> Any? { NSNumber(value: isOn) }
+    override func accessibilityPerformPress() -> Bool { onPress?(); return true }
+}
+
+/// A menu row with an icon, a title, a status line and a switch. Clicking
+/// anywhere on the row flips the switch, and the menu stays open so the
+/// change is visible straight away.
+final class SwitchRow: NSView {
+    private let badge: BadgeView
+    private let titleLabel: NSTextField
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let toggle = ToggleSwitch()
+    var onChange: ((Bool) -> Void)?
+
+    init(title: String, symbol: String) {
+        badge = BadgeView(symbolName: symbol)
+        titleLabel = NSTextField(labelWithString: title)
+        super.init(frame: NSRect(x: 0, y: 0, width: 272, height: 44))
+        autoresizingMask = .width
+
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        toggle.setAccessibilityLabel(title)
+        toggle.onPress = { [weak self] in self?.flip() }
+
+        let text = NSStackView(views: [titleLabel, detailLabel])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 1
+
+        for v in [badge, text, toggle] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            badge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            badge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            badge.widthAnchor.constraint(equalToConstant: 26),
+            badge.heightAnchor.constraint(equalToConstant: 26),
+            text.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 10),
+            text.centerYAnchor.constraint(equalTo: centerYAnchor),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: toggle.leadingAnchor, constant: -10),
+            toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            toggle.centerYAnchor.constraint(equalTo: centerYAnchor),
+            toggle.widthAnchor.constraint(equalToConstant: 44),
+            toggle.heightAnchor.constraint(equalToConstant: 20),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// Shows a state without calling onChange. Animates if the menu is open.
+    func show(_ on: Bool) {
+        toggle.setOn(on, animated: window?.isVisible == true)
+        badge.isOn = on
+    }
+
+    var detail: String {
+        get { detailLabel.stringValue }
+        set { detailLabel.stringValue = newValue }
+    }
+
+    private func flip() {
+        let on = !toggle.isOn
+        toggle.setOn(on, animated: true)
+        badge.isOn = on
+        onChange?(on)
+    }
+
+    // The whole row is one click target.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        frame.contains(point) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseUp(with event: NSEvent) {
+        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        flip()
+    }
 }
 
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private let menu = NSMenu()
     private let keeper = PowerKeeper()
     private var ticker: Timer?
+    private var menuIsOpen = false
 
     private var isOn = false
-    private var keepDisplayOn = true
-    private var killScreensaver = true
     private var lidMode = false
     private var expiry: Date?
 
+    // Menu pieces, built once and refreshed in place by syncMenu().
+    private let mainRow = SwitchRow(title: "Stay Awake", symbol: "cup.and.saucer.fill")
+    private let lidRow = SwitchRow(title: "Lid Closed", symbol: "laptopcomputer")
+    private let durationItem = NSMenuItem(title: "Duration", action: nil, keyEquivalent: "")
+    private var durationItems: [Duration: NSMenuItem] = [:]
+    private var displayItem: NSMenuItem!
+    private var screensaverItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
+    private var passwordlessItem: NSMenuItem!
+
     func applicationDidFinishLaunching(_ note: Notification) {
+        Prefs.registerDefaults()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let menu = NSMenu()
-        menu.delegate = self
+        buildMenu()
         statusItem.menu = menu
 
         // A previous run may have crashed mid-session; pick up its leftovers.
         if Lid.isDisabled() || UserDefaults.standard.object(forKey: Screensaver.backupKey) != nil {
             lidMode = Lid.isDisabled()
             isOn = lidMode
-            if isOn { keeper.setSystem(true); keeper.setDisplay(keepDisplayOn) }
+            if isOn { keeper.setSystem(true); keeper.setDisplay(Prefs.keepDisplayOn) }
         }
 
         refreshIcon()
-        ticker = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
+        syncMenu()
+        // Common modes so the countdown keeps updating while the menu is open.
+        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        ticker = t
 
         if !Prefs.hasLaunchedBefore {
             Prefs.hasLaunchedBefore = true
@@ -216,40 +458,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ note: Notification) {
-        turnOff(promptForLid: true)
+        turnOff()
     }
 
     // MARK: State
 
-    private func turnOn(duration: TimeInterval?) {
-        expiry = duration.map { Date().addingTimeInterval($0) }
+    private func turnOn() {
+        expiry = Prefs.duration.seconds.map { Date().addingTimeInterval($0) }
         isOn = true
         keeper.setSystem(true)
-        keeper.setDisplay(keepDisplayOn)
-        if killScreensaver { Screensaver.disable() }
+        keeper.setDisplay(Prefs.keepDisplayOn)
+        if Prefs.disableScreensaver { Screensaver.disable() }
         refreshIcon()
+        syncMenu()
     }
 
-    private func turnOff(promptForLid: Bool) {
+    private func turnOff() {
         isOn = false
         expiry = nil
         keeper.setSystem(false)
         keeper.setDisplay(false)
         Screensaver.restore()
-        if lidMode, promptForLid {
+        if lidMode {
             Lid.setDisabled(false)
             lidMode = false
         }
         refreshIcon()
+        syncMenu()
     }
 
     private func tick() {
         if let e = expiry, Date() >= e {
-            turnOff(promptForLid: true)
-            alert("StayAwake timer finished",
-                  "Normal sleep, screensaver and lid behaviour have been restored.")
+            expiry = nil
+            afterMenuCloses { [self] in
+                turnOff()
+                alert("StayAwake timer finished",
+                      "Normal sleep, screensaver and lid behaviour have been restored.")
+            }
+            return
         }
-        refreshIcon()
+        if menuIsOpen { syncMenu() }
+    }
+
+    /// Alerts and password prompts can't appear over an open menu, so close it
+    /// and run `work` once menu tracking has finished.
+    private func afterMenuCloses(_ work: @escaping () -> Void) {
+        menu.cancelTracking()
+        RunLoop.main.perform(inModes: [.default], block: work)
     }
 
     private func refreshIcon() {
@@ -264,9 +519,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func remainingText() -> String {
         guard isOn else { return "Off" }
         guard let e = expiry else { return "On, no time limit" }
-        let secs = max(0, Int(e.timeIntervalSinceNow))
-        let h = secs / 3600, m = (secs % 3600) / 60
-        return h > 0 ? "On, \(h)h \(m)m left" : "On, \(m)m left"
+        let mins = max(1, Int((e.timeIntervalSinceNow / 60).rounded(.up)))
+        let h = mins / 60, m = mins % 60
+        if h == 0 { return "On, \(m)m left" }
+        return m == 0 ? "On, \(h)h left" : "On, \(h)h \(m)m left"
     }
 
     // MARK: Dialogs
@@ -286,7 +542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               Look for the coffee cup next to the clock. Click it to keep your Mac \
               awake, keep the screen on, or keep working with the lid closed.
 
-              Tip: turn on Launch at Login so it is always there.
+              Tip: turn on Launch at Login in Settings so it is always there.
               """)
     }
 
@@ -318,113 +574,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Menu
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
+    //   [cup]  Stay Awake        (o )
+    //   [lid]  Lid Closed        ( o)
+    //   ---------------------------
+    //   Duration                   >
+    //   Settings                   >
+    //   ---------------------------
+    //   Quit StayAwake            ⌘Q
+    private func buildMenu() {
+        menu.delegate = self
+        menu.showsStateColumn = false
 
-        let status = NSMenuItem(title: remainingText(), action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
-        menu.addItem(.separator())
-
-        let toggle = NSMenuItem(title: isOn ? "Turn Off" : "Turn On",
-                                action: #selector(toggleMain), keyEquivalent: "")
-        toggle.target = self
-        menu.addItem(toggle)
-        menu.addItem(.separator())
-
-        add(menu, "Keep Display On", #selector(toggleDisplay), keepDisplayOn)
-        add(menu, "Disable Screensaver", #selector(toggleScreensaver), killScreensaver)
-        let lid = add(menu, "Stay Awake with Lid Closed", #selector(toggleLid), lidMode)
-        lid.toolTip = SudoersRule.isInstalled
-            ? "Uses pmset disablesleep. No password needed."
-            : "Needs administrator rights. Uses pmset disablesleep."
-        if !SudoersRule.isInstalled {
-            let setup = NSMenuItem(title: "Set Up Passwordless Lid Mode…",
-                                   action: #selector(setUpPasswordless), keyEquivalent: "")
-            setup.target = self
-            setup.indentationLevel = 1
-            menu.addItem(setup)
+        mainRow.onChange = { [weak self] on in self?.setMain(on) }
+        lidRow.onChange = { [weak self] on in self?.setLid(on) }
+        for row in [mainRow, lidRow] {
+            let item = NSMenuItem()
+            item.view = row
+            menu.addItem(item)
         }
         menu.addItem(.separator())
 
         let durations = NSMenu()
-        let opts: [(String, TimeInterval?)] = [
-            ("No time limit", nil), ("1 hour", 3600), ("2 hours", 7200),
-            ("4 hours", 14400), ("8 hours", 28800), ("Until 9 AM", secondsUntil9AM())
-        ]
-        for (label, secs) in opts {
-            let item = NSMenuItem(title: label, action: #selector(pickDuration(_:)), keyEquivalent: "")
+        for d in Duration.allCases {
+            let item = NSMenuItem(title: d.title, action: #selector(pickDuration(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = secs.map { NSNumber(value: $0) }
+            item.representedObject = d.rawValue
             durations.addItem(item)
+            durationItems[d] = item
         }
-        let dur = NSMenuItem(title: "Turn On For", action: nil, keyEquivalent: "")
-        menu.setSubmenu(durations, for: dur)
-        menu.addItem(dur)
+        durationItem.submenu = durations
+        menu.addItem(durationItem)
+
+        let settings = NSMenu()
+        displayItem = add(settings, "Keep Display On", #selector(toggleDisplay))
+        screensaverItem = add(settings, "Disable Screensaver", #selector(toggleScreensaver))
+        settings.addItem(.separator())
+        loginItem = add(settings, "Launch at Login", #selector(toggleLogin))
+        passwordlessItem = add(settings, "Set Up Passwordless Lid Mode…", #selector(setUpPasswordless))
+        settings.addItem(.separator())
+        add(settings, "About StayAwake \(appVersion)", #selector(openAbout))
+        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        settingsItem.submenu = settings
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
 
-        add(menu, "Launch at Login", #selector(toggleLogin), launchAtLoginEnabled())
-        let about = NSMenuItem(title: "About StayAwake \(appVersion)",
-                               action: #selector(openAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
         let quit = NSMenuItem(title: "Quit StayAwake", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
 
     @discardableResult
-    private func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ checked: Bool) -> NSMenuItem {
+    private func add(_ menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
-        item.state = checked ? .on : .off
         menu.addItem(item)
         return item
     }
 
-    private func secondsUntil9AM() -> TimeInterval {
-        let cal = Calendar.current
-        let now = Date()
-        var next = cal.date(bySettingHour: 9, minute: 0, second: 0, of: now)!
-        if next <= now { next = cal.date(byAdding: .day, value: 1, to: next)! }
-        return next.timeIntervalSince(now)
+    private func syncMenu() {
+        mainRow.show(isOn)
+        mainRow.detail = remainingText()
+        lidRow.show(lidMode)
+        lidRow.detail = lidMode ? "On, safe to close the lid" : "Off, sleeps when closed"
+
+        let current = Prefs.duration
+        for (d, item) in durationItems { item.state = d == current ? .on : .off }
+        if #available(macOS 14.4, *) {
+            durationItem.subtitle = current.title
+        } else {
+            durationItem.title = "Duration: \(current.title)"
+        }
+
+        displayItem.state = Prefs.keepDisplayOn ? .on : .off
+        screensaverItem.state = Prefs.disableScreensaver ? .on : .off
+        loginItem.state = launchAtLoginEnabled() ? .on : .off
+        passwordlessItem.isHidden = SudoersRule.isInstalled
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        syncMenu()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 
     // MARK: Actions
 
-    @objc private func toggleMain() {
-        isOn ? turnOff(promptForLid: true) : turnOn(duration: nil)
+    private func setMain(_ on: Bool) {
+        if on {
+            turnOn()
+            return
+        }
+        // With the passwordless rule, lid mode switches off without any UI.
+        if lidMode, Lid.setSilently(false) { lidMode = false }
+        if lidMode {
+            afterMenuCloses { [self] in turnOff() }   // will ask for the admin password
+        } else {
+            turnOff()
+        }
+    }
+
+    private func setLid(_ want: Bool) {
+        guard want != lidMode else { return }
+        if Lid.setSilently(want) {
+            lidChanged(to: want)
+            return
+        }
+
+        // Needs a dialog. Put the switch back until it actually succeeds.
+        syncMenu()
+        afterMenuCloses { [self] in
+            // First time turning it on without the rule: offer to set it up once.
+            if want, !SudoersRule.isInstalled, !Prefs.lidAskEachTime {
+                switch offerPasswordlessSetup() {
+                case .setUp:
+                    guard SudoersRule.install() else { return }
+                case .askEachTime:
+                    Prefs.lidAskEachTime = true
+                case .cancel:
+                    return
+                }
+            }
+            guard Lid.setDisabled(want) else { return }   // cancelled the password prompt
+            lidChanged(to: want)
+        }
+    }
+
+    private func lidChanged(to on: Bool) {
+        lidMode = on
+        if on, !isOn { turnOn() }
+        refreshIcon()
+        syncMenu()
+    }
+
+    @objc private func pickDuration(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let d = Duration(rawValue: raw) else { return }
+        Prefs.duration = d
+        turnOn()   // starts it, or restarts the timer if already on
     }
 
     @objc private func toggleDisplay() {
-        keepDisplayOn.toggle()
-        if isOn { keeper.setDisplay(keepDisplayOn) }
+        Prefs.keepDisplayOn.toggle()
+        if isOn { keeper.setDisplay(Prefs.keepDisplayOn) }
     }
 
     @objc private func toggleScreensaver() {
-        killScreensaver.toggle()
-        if isOn { killScreensaver ? Screensaver.disable() : Screensaver.restore() }
-    }
-
-    @objc private func toggleLid() {
-        let want = !lidMode
-
-        // First time turning it on without the rule: offer to set it up once.
-        if want, !SudoersRule.isInstalled, !Prefs.lidAskEachTime {
-            switch offerPasswordlessSetup() {
-            case .setUp:
-                guard SudoersRule.install() else { return }
-            case .askEachTime:
-                Prefs.lidAskEachTime = true
-            case .cancel:
-                return
-            }
-        }
-
-        guard Lid.setDisabled(want) else { return }   // cancelled the password prompt
-        lidMode = want
-        if want, !isOn { turnOn(duration: nil) }
-        refreshIcon()
+        Prefs.disableScreensaver.toggle()
+        if isOn { Prefs.disableScreensaver ? Screensaver.disable() : Screensaver.restore() }
     }
 
     @objc private func setUpPasswordless() {
@@ -432,10 +731,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Prefs.lidAskEachTime = false
             alert("All set", "Lid mode will no longer ask for your password.")
         }
-    }
-
-    @objc private func pickDuration(_ sender: NSMenuItem) {
-        turnOn(duration: (sender.representedObject as? NSNumber)?.doubleValue)
     }
 
     private func launchAtLoginEnabled() -> Bool {

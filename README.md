@@ -26,20 +26,20 @@ That's it. A coffee cup appears next to your clock. Click it.
 
 | Menu item | Effect |
 |---|---|
-| **Turn On / Off** | Keeps the Mac from idle-sleeping |
-| **Keep Display On** | Screen stays lit |
-| **Disable Screensaver** | Screensaver never starts, so the Mac never locks |
-| **Stay Awake with Lid Closed** | Keep working with the lid shut, no external monitor needed |
-| **Turn On For** | 1h, 2h, 4h, 8h, until 9 AM, or no limit |
-| **Launch at Login** | Always in the menu bar |
+| **Stay Awake** switch | Keeps the Mac from idle-sleeping |
+| **Lid Closed** switch | Keep working with the lid shut, no external monitor needed |
+| **Duration** | No time limit, 1h, 2h, 4h, 8h or until 9 AM. Picking one turns it on |
+| **Settings** > Keep Display On | Screen stays lit |
+| **Settings** > Disable Screensaver | Screensaver never starts, so the Mac never locks |
+| **Settings** > Launch at Login | Always in the menu bar |
 
-The cup is hollow when off and filled when on. Turning it off, or quitting, puts everything back the way it was.
+The switches flip in place, so the menu stays open and you see the change straight away. The cup is hollow when off and filled when on. Turning it off, or quitting, puts everything back the way it was.
 
 ## The lid-closed part
 
 macOS will not let a normal app stop the Mac from sleeping when you shut the lid. The only way is `pmset disablesleep`, which needs administrator rights.
 
-The first time you click **Stay Awake with Lid Closed**, StayAwake asks:
+The first time you switch on **Lid Closed**, StayAwake asks:
 
 - **Set Up Once** installs a small rule so it never asks for your password again.
 - **Ask Each Time** shows the normal macOS password dialog on every toggle.
